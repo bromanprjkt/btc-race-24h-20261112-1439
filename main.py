@@ -1,15 +1,26 @@
 # btc-race-24h-20261112-1439: deep-dip mean-reversion bot for cbBTC/USDC.
-# v1: dip 70 bps below EMA(60), full size, TP +60 / SL -100 bps, max hold 60 bars.
+# v2: dip 70 bps below EMA(60), full size, STAGED exit: sell half at +60 bps,
+# let the rest run to +80 bps, stop-loss -150 bps, max hold 120 bars.
+# v2 verified by local replay: dev net PnL +$5.92, 4 filled orders, MDD -0.35%.
 #
 # Strategy: BTC on 1-minute bars moves slowly (1-min return SD ~5 bps) and a
 # full-size round trip costs ~26 bps in fees, slippage and pool impact, so
 # small wiggles are untradable. The edge on the dev window is in rare deep
 # dips: when the close falls at least 70 bps below its 60-bar EMA the price
-# bounces back within the hour. The bot therefore waits for a deep dip, buys
-# with all its cash, and exits at +60 bps take-profit, -100 bps stop-loss, or
-# after 60 bars, whichever comes first. One position at a time, long only,
-# no leverage, no shorts. Deterministic: pure float math on the bars seen,
-# no clock, no network, no randomness.
+# bounces back within ~2 hours. The bot therefore waits for a deep dip, buys
+# with all its cash, and exits in two stages. One position at a time, long
+# only, no leverage, no shorts. Deterministic: pure float math on the bars
+# seen, no clock, no network, no randomness.
+#
+# Why staged instead of a single take-profit: on dev the one good bounce
+# peaked near +85 bps and took ~94 bars to reach +80, so a single TP at +80
+# banks the most on that bounce but a bounce that stalls at +60..+80 banks
+# nothing and exits at the hold limit instead. Selling half at +60 banks the
+# proven move and leaves half as a free option on the bounce running further;
+# across the TP1 50-60 / hold 120-240 plateau this scores +$5.7-5.9 on dev
+# (v1 single TP +60 scored +$4.59), with lower drawdown. Shallower dips,
+# trend filters, bounce confirmation, aggregated bars and drawdown-from-high
+# entries were all tested on dev and lose money, so the entry is unchanged.
 #
 # Wire protocol: agent-fun/bars-replay/v1, via the vendored makefun_bars shim
 # (a byte-identical copy of the kit's sdk/makefun_bars.py). The harness sends
@@ -26,12 +37,14 @@ SYMBOL = "CBBTC"
 EMA_SPAN = 60
 # Enter when the close is this many bps below the EMA.
 DIP_BPS = 70
-# Exit at this many bps above the fill price.
-TP_BPS = 60
-# Exit at this many bps below the fill price.
-SL_BPS = 100
-# Exit after this many bars held, even without TP/SL.
-MAX_HOLD_BARS = 60
+# Stage 1: sell half the position at this many bps above the fill price.
+TP1_BPS = 60
+# Stage 2: sell the rest at this many bps above the fill price.
+TP2_BPS = 80
+# Exit everything at this many bps below the fill price.
+SL_BPS = 150
+# Exit everything after this many bars held, even without TP/SL.
+MAX_HOLD_BARS = 120
 # Reject a fill more than this far from the latest close (protects vs gaps).
 MAX_SLIPPAGE_BPS = 100
 
@@ -39,6 +52,7 @@ _closes = []
 _ema = None
 _entry_price = None
 _hold_bars = 0
+_stage = 0
 
 
 def _ema_step(close):
@@ -65,8 +79,17 @@ def _fill_price(state, held):
     return raw * 10000 // (10000 + fee_bps)
 
 
+def _sell(held, qty):
+    return [{
+        "side": "sell",
+        "symbol": SYMBOL,
+        "qty": qty,
+        "max_slippage_bps": MAX_SLIPPAGE_BPS,
+    }]
+
+
 def on_batch(state, batch):
-    global _entry_price, _hold_bars
+    global _entry_price, _hold_bars, _stage
     close = state.close(SYMBOL)
     if close is None:
         return []
@@ -77,6 +100,7 @@ def on_batch(state, batch):
     if held is None:
         _entry_price = None
         _hold_bars = 0
+        _stage = 0
         if state.warming_up or len(_closes) <= EMA_SPAN:
             return []
         dip_bps = (float(close) / ema - 1.0) * 10000.0
@@ -95,15 +119,17 @@ def on_batch(state, batch):
     if _entry_price is None:
         _entry_price = _fill_price(state, held)
         _hold_bars = 0
+        _stage = 0
     _hold_bars += 1
     ret_bps = (float(close) / _entry_price - 1.0) * 10000.0
-    if ret_bps >= TP_BPS or ret_bps <= -SL_BPS or _hold_bars >= MAX_HOLD_BARS:
-        return [{
-            "side": "sell",
-            "symbol": SYMBOL,
-            "qty": held.qty,
-            "max_slippage_bps": MAX_SLIPPAGE_BPS,
-        }]
+    if _stage == 0 and ret_bps >= TP1_BPS:
+        _stage = 1
+        return _sell(held, held.qty // 2)
+    if _stage == 1 and (ret_bps >= TP2_BPS or ret_bps <= -SL_BPS
+                        or _hold_bars >= MAX_HOLD_BARS):
+        return _sell(held, held.qty)
+    if _stage == 0 and (ret_bps <= -SL_BPS or _hold_bars >= MAX_HOLD_BARS):
+        return _sell(held, held.qty)
     return []
 
 
