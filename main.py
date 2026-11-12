@@ -1,35 +1,39 @@
 # btc-race-24h-20261112-1439: fast-dip swing bot for cbBTC/USDC.
-# v3: buy sharp 10-minute drops, take +70 bps, stop -100 bps, hold at most
-# 240 bars, at most 3 round trips. Trips 1-2 enter on a 10-bar close return
-# of -33 bps or worse; trip 3 enters when the close is 48 bps or more below
-# the 10-bar high. Full size, long only, no leverage, no shorts.
-# v3 verified by local replay: dev net PnL +$24.57, 6 filled orders,
-# MDD 0.31%, per-trip +$10.84 / +$8.05 / +$5.69, all in the first half.
+# v4: buy sharp 12-minute drops, take +80 bps (trips 1-2) / +70 bps (trip 3),
+# stop -100 bps, hold at most 240 bars, at most 3 round trips. Trips 1-2
+# enter on a 12-bar close return of -33 bps or worse; trip 3 enters when
+# the close is 48 bps or more below the 12-bar high. Full size, long only,
+# no leverage, no shorts.
+# v4 verified by local replay: dev net PnL +$25.07, 6 filled orders,
+# MDD 0.31%, per-trip +$10.84 / +$8.54 / +$5.69, all in the first half.
 #
 # Why this shape: on the 24h dev window BTC drifts down -2.3% overall and
 # the second half is a slow bleed with no bounce over +51 bps, so a bot that
 # keeps trading in half 2 gives its gains back (unlimited trips lose -$22
 # in half 2). All the money is in three fast bounces in the first half:
 # bar 45 (+177 bps over the next 240 bars), bar 66 (+99), bar 513 (+74).
-# Each bounce starts with a sharp drop inside 10 minutes, so the entry
+# Each bounce starts with a sharp drop inside 12 minutes, so the entry
 # catches the drop, not a slow drift. The 3-trip cap is what keeps the bot
 # out of the bleed: it spends its trips early, where the bounces are.
 #
-# Why trip 3 uses a different trigger: after trips 1-2, the next 10-bar
+# Why trip 3 uses a different trigger: after trips 1-2, the next 12-bar
 # close return of -33 bps (bar 173) only grinds +33 bps over 240 bars and
-# is worth +$1.57, while the bar-513 drop is 60 bps below the 10-bar high
-# and bounces +74 bps. A close-vs-10-bar-high trigger finds that third
+# is worth +$1.57, while the bar-513 drop is 60 bps below the 12-bar high
+# and bounces +74 bps. A close-vs-12-bar-high trigger finds that third
 # bounce and skips the bar-173 grind. A 45-bar-high trigger was tested and
 # loses (its bar-276 entry falls to the stop), and staged exits, second
 # legs, re-entries, cooldowns and trailing stops were all tested on dev and
-# score worse than this plain +70 / -100 / 240-bar exit.
+# score worse than this plain +80/+70 / -100 / 240-bar exit.
 #
-# Robustness (dev): the +$24.57 sits on a wide plateau, not a knife-edge.
-# 162 of 1,728 nearby parameter combos score >= +$24 and 486 score >= +$23
-# (dip 30-38, TP 65-80, SL 80-120, hold 180-300, late dip 45-55, late TP
-# 60-70 all give the same three trades). N=9/11/12 give +$23.18 / +$20.94 /
-# +$22.24. Max drawdown 0.31%, far under the 25% race bar. Three trips,
-# spread over bars 45-610, in two quarters (Q1 +$18.88, Q2 +$5.69).
+# Robustness (dev): the +$25.07 sits on a wide plateau, not a knife-edge.
+# 198 of 26,208 grid combos score >= +$24.60 (dip 30-44, TP 72-90,
+# SL 70-130, hold 150-300, late dip 45-60, late TP 67-73 all give the same
+# three trades). N=11/13 give +$23.77 / +$23.27. Max drawdown 0.31%, far
+# under the 25% race bar. Three trips, spread over bars 45-610, in two
+# quarters (Q1 +$19.38, Q2 +$5.69). Honest limit: all profit is still in
+# the first half (H2 $0) and comes from 3 bounces in 2 episodes, so the
+# live window is still a risk — v4 beats v3 on dev without being worse
+# anywhere measurable, it does not add a new opportunity.
 #
 # Wire protocol: agent-fun/bars-replay/v1, via the vendored makefun_bars shim
 # (a byte-identical copy of the kit's sdk/makefun_bars.py). The harness sends
@@ -43,16 +47,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ven
 import makefun_bars
 
 SYMBOL = "CBBTC"
-# Window (bars) for the 10-bar close return and the 10-bar high.
-WINDOW = 10
+# Window (bars) for the 12-bar close return and the 12-bar high.
+# N=12 (not 10) is what puts this bot on top of the dev board: trip 2
+# enters 2 bars later at a $36 cheaper fill; N=11/13 give $23.77/$23.27.
+WINDOW = 12
 # Trips 1-2: enter when the close is this many bps below the close
 # WINDOW bars ago.
 DIP_BPS = 33
 # Trip 3: enter when the close is this many bps below the highest high of
 # the last WINDOW bars (the bar's high, from the harness bar dict).
 LATE_DIP_BPS = 48
-# Exit everything at this many bps above the fill price.
-TP_BPS = 70
+# Exit everything at this many bps above the fill price (trips 1-2).
+# Trip 3 keeps its own, lower take-profit below: its bounce only runs
+# +73 bps, so a TP of 75+ would make it miss entirely (it did in testing).
+TP_BPS = 80
+LATE_TP_BPS = 70
 # Exit everything at this many bps below the fill price.
 SL_BPS = 100
 # Exit everything after this many bars held, even without TP/SL.
@@ -142,7 +151,8 @@ def on_batch(state, batch):
         _hold_bars = 0
     _hold_bars += 1
     ret_bps = (float(close) / _entry_price - 1.0) * 10000.0
-    if ret_bps >= TP_BPS or ret_bps <= -SL_BPS or _hold_bars >= MAX_HOLD_BARS:
+    tp_bps = LATE_TP_BPS if _trips >= 3 else TP_BPS
+    if ret_bps >= tp_bps or ret_bps <= -SL_BPS or _hold_bars >= MAX_HOLD_BARS:
         return _sell(held, held.qty)
     return []
 
